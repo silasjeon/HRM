@@ -1,5 +1,5 @@
+-e ./adam-atan2-pytorch
 torch
-adam-atan2
 einops
 tqdm
 coolname
@@ -9,3 +9,4 @@ wandb
 omegaconf
 hydra-core
 huggingface_hub
+numpy

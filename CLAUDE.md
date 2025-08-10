@@ -6,6 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the Hierarchical Reasoning Model (HRM) - a 27M parameter recurrent neural architecture for complex reasoning tasks. It achieves state-of-the-art results on ARC-AGI, Sudoku, and maze-solving with only 1000 training samples.
 
+## Setup / Installation
+
+To set up the project and install dependencies:
+
+```bash
+# First, clone the adam-atan2-pytorch optimizer into the project root.
+# It is a separate repository and not included with the initial clone of this project.
+git clone https://github.com/lucidrains/adam-atan2-pytorch.git adam-atan2-pytorch
+
+# Install all dependencies, including adam-atan2-pytorch from the local directory
+pip install -r requirements.txt
+```
+
+- The `adam-atan2-pytorch` optimizer is installed via `-e ./adam-atan2-pytorch` in `requirements.txt`.
+
+- If the optimizer is available on PyPI, you may also install it directly (though local cloning is recommended for specific versions):
+
+```bash
+pip install adam-atan2-pytorch
+```
+
 ## Common Commands
 
 ### Dataset Building
