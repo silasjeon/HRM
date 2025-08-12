@@ -1,0 +1,21 @@
+[project]
+name = "hrm"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "einops",
+    "tqdm",
+    "coolname",
+    "pydantic",
+    "argdantic",
+    "wandb",
+    "omegaconf",
+    "hydra-core",
+    "huggingface_hub",
+    "numpy",
+    "adam-atan2-pytorch",
+]
+
+[tool.uv.sources]
+adam-atan2-pytorch = { path = "./adam-atan2-pytorch", editable = true } 

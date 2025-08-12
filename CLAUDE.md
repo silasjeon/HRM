@@ -27,6 +27,29 @@ pip install -r requirements.txt
 pip install adam-atan2-pytorch
 ```
 
+### Setup with uv and Python 3.11
+
+To set up the project using uv for faster dependency management with Python 3.11:
+
+```bash
+# Install uv if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the adam-atan2-pytorch optimizer
+git clone https://github.com/lucidrains/adam-atan2-pytorch.git adam-atan2-pytorch
+
+# Create virtual environment with Python 3.11
+uv venv --python 3.11
+
+# Activate the environment
+source .venv/bin/activate
+
+# Install dependencies from pyproject.toml
+uv sync
+```
+
+This will install all required dependencies, including the local editable adam-atan2-pytorch.
+
 ## Common Commands
 
 ### Dataset Building
