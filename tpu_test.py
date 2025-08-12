@@ -13,12 +13,12 @@ os.environ["PJRT_DEVICE"] = "TPU"
 print("DEBUG: Setting TPU_VISIBLE_DEVICES to 0,1,2,3 (based on ls output)")
 os.environ["TPU_VISIBLE_DEVICES"] = "0,1,2,3"  # Adjusted to match your ls output (accel0-3)
 
-# Additional XLA flags for debugging and potential fix
-print("DEBUG: Setting XLA_FLAGS for core dump and debug")
+# Simplified XLA flags - only use known valid flags to avoid parse errors
+print("DEBUG: Setting simplified XLA_FLAGS")
 os.environ["XLA_FLAGS"] = (
-    "--xla_tpu_debug_allow_core_dump=true "
-    "--xla_tpu_debug_dump_anomalies_only=true "
-    "--xla_force_host_platform_device_count=1"  # Fallback to simulate single device if needed
+    "--xla_cpu_enable_fast_math=false "  # Known flag
+    "--xla_gpu_force_compilation_parallelism=8"  # Known flag
+    # Removed debug flags that caused parse errors
 )
 
 # Try to import torch_xla modules with version check
@@ -42,16 +42,32 @@ def _test_fn(rank: int):
     # Log rank and process info
     print(f"DEBUG [Rank {rank}]: Starting test function")
     print(f"DEBUG [Rank {rank}]: Process ID: {os.getpid()}")
-    print(f"DEBUG [Rank {rank}]: XLA ordinal: {xm.get_ordinal()}")
-    print(f"DEBUG [Rank {rank}]: XLA world size: {xm.xrt_world_size()}")
 
-    # List all /dev/accel* files for debug
+    # Check permissions on /dev/accel* files
     try:
-        accel_files = [f for f in os.listdir('/dev') if f.startswith('accel')]
-        print(f"DEBUG [Rank {rank}]: Available accel devices: {accel_files}")
+        accel_files = [f"/dev/accel{i}" for i in range(4)]  # Based on your ls: accel0-3
+        for file in accel_files:
+            if os.path.exists(file):
+                readable = os.access(file, os.R_OK)
+                writable = os.access(file, os.W_OK)
+                print(f"DEBUG [Rank {rank}]: {file} exists. Readable: {readable}, Writable: {writable}")
+            else:
+                print(f"DEBUG [Rank {rank}]: {file} does not exist")
     except Exception as e:
-        print(f"ERROR [Rank {rank}]: Failed to list /dev/accel*")
+        print(f"ERROR [Rank {rank}]: Failed to check /dev/accel* permissions")
         print(f"ERROR DETAILS: {str(e)}")
+
+    # Get XLA ordinal and world size with deprecation handling
+    try:
+        ordinal = xm.get_ordinal() if hasattr(xm, 'get_ordinal') else torch_xla.runtime.global_ordinal()
+        world_size = xm.xrt_world_size()
+        print(f"DEBUG [Rank {rank}]: XLA ordinal: {ordinal}")
+        print(f"DEBUG [Rank {rank}]: XLA world size: {world_size}")
+    except Exception as e:
+        print(f"ERROR [Rank {rank}]: Failed to get ordinal/world size")
+        print(f"ERROR DETAILS: {str(e)}")
+        traceback.print_exc()
+        return
 
     # Get supported devices with error handling
     try:
@@ -113,8 +129,9 @@ def _test_fn(rank: int):
 if __name__ == "__main__":
     print("DEBUG: Starting main script")
     try:
-        # Spawn on all available devices (nprocs=None)
-        xmp.spawn(_test_fn, nprocs=None)
+        # Spawn on 4 processes (matching your accel0-3)
+        print("DEBUG: Spawning with nprocs=4 to match available devices")
+        xmp.spawn(_test_fn, nprocs=4)
         print("DEBUG: Spawn completed successfully")
     except Exception as e:
         print("ERROR: Failed to spawn processes - Falling back to single process test")
