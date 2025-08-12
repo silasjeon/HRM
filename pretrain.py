@@ -1,6 +1,7 @@
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os; os.environ["PJRT_DEVICE"] = "TPU"
+os.environ["TPU_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 import math
 import yaml
 import shutil
@@ -396,6 +397,9 @@ def launch(hydra_config: DictConfig):
 
 
 def _main_fn(rank: int, hydra_config: DictConfig):
+    # Device check for debugging
+    print(f"Rank {rank}: Supported XLA devices: {xm.get_xla_supported_devices('TPU')}")
+
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     # NOTE: XLA distributed is initialized automatically by spawn.
     # if "LOCAL_RANK" in os.environ:
