@@ -144,6 +144,7 @@ class Attention(nn.Module):
             attn_output = attn_output.transpose(1, 2)  # back to [batch_size, seq_len, num_heads, head_dim]
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
+        attn_output = attn_output.contiguous()
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
