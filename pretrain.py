@@ -1,6 +1,6 @@
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
-import os
+import os; os.environ["PJRT_DEVICE"] = "TPU"
 import math
 import yaml
 import shutil
@@ -9,6 +9,11 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+from torch_xla.distributed.parallel_loader import MpDeviceLoader
+from torch_xla.amp import autocast
 
 import tqdm
 import wandb
@@ -102,7 +107,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         num_workers=1,
         prefetch_factor=8,
 
-        pin_memory=True,
+        pin_memory=False, # pin_memory must be False when using MpDeviceLoader.
         persistent_workers=True
     )
     return dataloader, dataset.metadata
@@ -124,17 +129,19 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
-        model: nn.Module = model_cls(model_cfg)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+    device = xm.xla_device()
+    model: nn.Module = model_cls(model_cfg)
+    model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+    if "DISABLE_COMPILE" not in os.environ:
+        model = torch.compile(model, dynamic=False)  # type: ignore
+    model = model.to(device)
 
-        # Broadcast parameters from rank 0
-        if world_size > 1:
-            with torch.no_grad():
-                for param in list(model.parameters()) + list(model.buffers()):
-                    dist.broadcast(param, src=0)
+    # Broadcast parameters from rank 0
+    # NOTE: XLA handles this automatically.
+    # if world_size > 1:
+    #     with torch.no_grad():
+    #         for param in list(model.parameters()) + list(model.buffers()):
+    #             dist.broadcast(param, src=0)
 
     # Optimizers and lr
     optimizers = [
@@ -209,29 +216,32 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, device):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    # NOTE: MpDeviceLoader handles this automatically
+    # batch = {k: v.cuda() for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        with torch.device(device):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    with autocast():
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
 
     # Allreduce
-    if world_size > 1:
-        for param in train_state.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
+    # NOTE: xm.optimizer_step handles gradient synchronization
+    # if world_size > 1:
+    #     for param in train_state.model.parameters():
+    #         if param.grad is not None:
+    #             dist.all_reduce(param.grad)
             
     # Apply optimizer
     lr_this_step = None    
@@ -241,7 +251,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
             
-        optim.step()
+        xm.optimizer_step(optim, barrier=True)
         optim.zero_grad()
 
     # Reduce metrics
@@ -251,8 +261,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
         metric_values = torch.stack([metrics[k] for k in metric_keys])
-        if world_size > 1:
-            dist.reduce(metric_values, dst=0)
+        
+        metric_values = xm.reduce_mean(metric_values)
 
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
@@ -266,7 +276,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             return reduced_metrics
 
 
-def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, device):
     with torch.inference_mode():
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         
@@ -279,8 +289,9 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         carry = None
         for set_name, batch, global_batch_size in eval_loader:
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
+            # NOTE: MpDeviceLoader handles this automatically
+            # batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device(device):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -303,7 +314,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
+                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device=device)
                 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
@@ -317,8 +328,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         # Logging
         # Reduce to rank 0
         if metric_values is not None:
-            if world_size > 1:
-                dist.reduce(metric_values, dst=0)
+            metric_values = xm.reduce_mean(metric_values, dim=0)
             
             if rank == 0:
                 reduced_metrics = metric_values.cpu().numpy()
@@ -360,40 +370,45 @@ def save_code_and_config(config: PretrainConfig):
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
-    objects = [None]
+    # With XLA, all processes get the same hydra config, so we can instantiate it directly.
+    # A barrier is used to ensure that rank 0 creates the checkpoint directory before other ranks might need it.
+    config = PretrainConfig(**hydra_config)  # type: ignore
+    
+    # Naming
+    if config.project_name is None:
+        config.project_name = f"{os.path.basename(config.data_path).capitalize()} ACT-torch"
+    if config.run_name is None:
+        config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
+    if config.checkpoint_path is None:
+        config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+
     if rank == 0:
-        config = PretrainConfig(**hydra_config)  # type: ignore
+        os.makedirs(config.checkpoint_path, exist_ok=True)
+    
+    xm.rendezvous("load_synced_config")
 
-        # Naming
-        if config.project_name is None:
-            config.project_name = f"{os.path.basename(config.data_path).capitalize()} ACT-torch"
-        if config.run_name is None:
-            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
-        if config.checkpoint_path is None:
-            config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
-
-        objects = [config]
-
-    if world_size > 1:
-        dist.broadcast_object_list(objects, src=0)
-
-    return objects[0]  # type: ignore
+    return config
 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
-    RANK = 0
-    WORLD_SIZE = 1
+    xmp.spawn(_main_fn, args=(hydra_config,), nprocs=8)
 
+
+def _main_fn(rank: int, hydra_config: DictConfig):
     # Initialize distributed training if in distributed environment (e.g. torchrun)
-    if "LOCAL_RANK" in os.environ:
-        # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl")
+    # NOTE: XLA distributed is initialized automatically by spawn.
+    # if "LOCAL_RANK" in os.environ:
+    #     # Initialize distributed, default device and dtype
+    #     dist.init_process_group(backend="nccl")
+    #
+    #     RANK = dist.get_rank()
+    #     WORLD_SIZE = dist.get_world_size()
+    #
+    #     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-        RANK = dist.get_rank()
-        WORLD_SIZE = dist.get_world_size()
-
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    RANK = xm.get_ordinal()
+    WORLD_SIZE = xm.xrt_world_size()
         
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
@@ -407,8 +422,12 @@ def launch(hydra_config: DictConfig):
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    device = xm.xla_device()
+    
+    train_loader, train_metadata = create_dataloader(config, "train", rank=RANK, world_size=WORLD_SIZE, test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size)
+    train_loader = MpDeviceLoader(train_loader, device)
+    eval_loader,  eval_metadata  = create_dataloader(config, "test", rank=RANK, world_size=WORLD_SIZE, test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size)
+    eval_loader = MpDeviceLoader(eval_loader, device)
 
     # Train state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
@@ -429,7 +448,7 @@ def launch(hydra_config: DictConfig):
         ############ Train Iter
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, device=device)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -437,7 +456,7 @@ def launch(hydra_config: DictConfig):
 
         ############ Evaluation
         train_state.model.eval()
-        metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
+        metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE, device=device)
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
@@ -447,8 +466,9 @@ def launch(hydra_config: DictConfig):
             save_train_state(config, train_state)
 
     # finalize
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    # NOTE: No need to call destroy_process_group with XLA
+    # if dist.is_initialized():
+    #     dist.destroy_process_group()
     wandb.finish()
 
 

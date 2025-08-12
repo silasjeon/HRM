@@ -1,5 +1,6 @@
 -e ./adam-atan2-pytorch
 torch
+torch_xla[tpu]
 einops
 tqdm
 coolname
