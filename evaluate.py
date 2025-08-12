@@ -23,7 +23,7 @@ class EvalConfig(pydantic.BaseModel):
 
 def launch():
     eval_cfg = EvalConfig(**OmegaConf.to_container(OmegaConf.from_cli()))  # type: ignore
-    xmp.spawn(_eval_fn, args=(eval_cfg,), nprocs=8)
+    xmp.spawn(_eval_fn, args=(eval_cfg,), nprocs=None)
 
 
 def _eval_fn(rank: int, eval_cfg: EvalConfig):

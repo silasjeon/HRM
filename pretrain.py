@@ -392,7 +392,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
-    xmp.spawn(_main_fn, args=(hydra_config,), nprocs=8)
+    xmp.spawn(_main_fn, args=(hydra_config,), nprocs=None)
 
 
 def _main_fn(rank: int, hydra_config: DictConfig):
